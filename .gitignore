@@ -1,0 +1,62 @@
+### --- Jupyter Notebook Specific --- ###
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+# Chặn các file lưu tạm khi đang sửa notebook
+.ipynb_checkpoints
+# Chặn các file xuất ra từ notebook (nếu bạn không muốn lưu)
+# *.html
+# *.pdf
+
+### --- Python & Environments --- ###
+# Thư mục môi trường ảo (Cực kỳ quan trọng)
+.venv/
+env/
+venv/
+ENV/
+bin/
+lib/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+### --- Data & Models (Dành cho đồ án ML/Data) --- ###
+# Chặn các file dữ liệu nặng (thường sẽ để trong folder data/)
+data/raw/
+data/processed/
+*.csv
+*.xlsx
+*.json
+*.sql
+*.sqlite
+
+# Chặn các file model đã train xong (thường rất nặng)
+*.pth
+*.pkl
+*.h5
+*.joblib
+*.onnx
+
+### --- Operating System --- ###
+.DS_Store
+Thumbs.db
+desktop.ini
+
+### --- Secret / Config --- ###
+.env
+.flaskenv
+secrets.json
