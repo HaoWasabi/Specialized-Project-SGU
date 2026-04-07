@@ -34,6 +34,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 ### --- Data & Models (Dành cho đồ án ML/Data) --- ###
 # Chặn các file dữ liệu nặng (thường sẽ để trong folder data/)
 data/raw/
