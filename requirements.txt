@@ -5,3 +5,6 @@ scikit-learn
 tensorflow 
 pyswarms 
 matplotlib
+streamlit
+plotly
+pytest

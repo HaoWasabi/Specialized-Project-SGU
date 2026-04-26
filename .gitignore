@@ -45,11 +45,13 @@ htmlcov/
 # Chặn các file dữ liệu nặng (thường sẽ để trong folder data/)
 data/raw/
 data/processed/
-*.csv
-*.xlsx
-*.json
-*.sql
-*.sqlite
+
+# Artefacts khi chạy ứng dụng / notebook
+artifacts/
+*.log
+
+# Cấu hình cục bộ cho Streamlit
+.streamlit/secrets.toml
 
 # Chặn các file model đã train xong (thường rất nặng)
 *.pth
