@@ -39,9 +39,18 @@ class LSTMConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FineTuneConfig:
+    epochs: int = 20
+    validation_split: float = 0.10
+    patience: int = 5
+    learning_rate_factor: float = 0.3
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     pso: PSOConfig = field(default_factory=PSOConfig)
     baseline: LSTMConfig = field(default_factory=LSTMConfig)
+    fine_tune: FineTuneConfig = field(default_factory=FineTuneConfig)
     final_training_epochs: int = 100
     artifact_dir: Path = field(default_factory=lambda: Path("artifacts"))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,14 +47,7 @@ class PSOLSTMExperiment:
 
     def load_and_prepare_data(self) -> pd.DataFrame:
         self.raw_df = self.data_provider.fetch_benchmark(self.config.data.start_date)
-        self.prepared_df = self.raw_df.copy()
-        self._normalize_date_column(self.prepared_df)
-        self.scaled_data, self.scaler_gold, self.feature_scaler, self.feature_columns = (
-            prepare_multivariate_features(self.prepared_df)
-        )
-        self.num_features = int(self.scaled_data.shape[1])
-        self.split_index = self._resolve_split_index(self.prepared_df, self.config.data.split_date)
-        return self.prepared_df
+        return self._prepare_filtered_data(self.raw_df)
 
     def plot_correlation(self) -> None:
         if self.prepared_df is None:
@@ -62,8 +56,12 @@ class PSOLSTMExperiment:
         corr_df = self.prepared_df.drop(columns=["Date"]).corr(numeric_only=True)
         plot_correlation_heatmap(corr_df)
 
-    def optimize_hyperparameters(self) -> OptimizationResult:
+    def optimize_hyperparameters(
+        self,
+        progress_callback: Callable[[int, int, float | None], None] | None = None,
+    ) -> OptimizationResult:
         self._ensure_prepared()
+        total_iterations = max(1, int(self.config.pso.iterations))
         optimizer = ps.single.GlobalBestPSO(
             n_particles=self.config.pso.n_particles,
             dimensions=self.config.pso.dimensions,
@@ -71,21 +69,115 @@ class PSOLSTMExperiment:
             bounds=self.config.pso.bounds,
         )
 
-        cost, raw_position = optimizer.optimize(self._objective_function, iters=self.config.pso.iterations)
+        current_iteration = 0
+
+        def objective_with_progress(particles: np.ndarray) -> np.ndarray:
+            nonlocal current_iteration
+            costs = self._objective_function(particles)
+            current_iteration += 1
+            if progress_callback is not None:
+                best_cost = float(np.min(costs)) if len(costs) > 0 else None
+                progress_callback(current_iteration, total_iterations, best_cost)
+            return costs
+
+        cost, raw_position = optimizer.optimize(
+            objective_with_progress,
+            iters=total_iterations,
+            verbose=False,
+        )
+        if progress_callback is not None:
+            progress_callback(total_iterations, total_iterations, float(cost))
+
         params = self._position_to_params(raw_position)
         return OptimizationResult(cost=float(cost), params=params, raw_position=np.asarray(raw_position))
 
-    def train_final_model(self, params: LSTMHyperParameters):
+    def get_window_stats(self, look_back: int) -> dict[str, int | bool]:
+        self._ensure_prepared()
+        if self.prepared_df is None or self.split_index is None:
+            raise RuntimeError("Dữ liệu chưa được chuẩn bị.")
+        if look_back <= 0:
+            raise ValueError("look_back phải lớn hơn 0.")
+
+        total_rows = len(self.prepared_df)
+        total_windows = max(0, total_rows - look_back)
+        train_windows = min(max(self.split_index - look_back, 0), total_windows)
+        test_windows = max(0, total_windows - train_windows)
+
+        return {
+            "look_back": int(look_back),
+            "total_rows": int(total_rows),
+            "split_index": int(self.split_index),
+            "total_windows": int(total_windows),
+            "train_windows": int(train_windows),
+            "test_windows": int(test_windows),
+            "is_valid": bool(total_windows > 0 and train_windows > 0 and test_windows > 0),
+        }
+
+    def validate_split_and_look_back(self, look_back: int) -> tuple[bool, str]:
+        stats = self.get_window_stats(look_back)
+        if stats["total_windows"] <= 0:
+            return (
+                False,
+                "Không tạo được window dữ liệu (total_windows=0). Hãy giảm look_back hoặc chọn ngày bắt đầu sớm hơn.",
+            )
+        if stats["train_windows"] <= 0:
+            return (
+                False,
+                (
+                    "Không có mẫu train (train_windows=0). "
+                    "Hãy đặt split_date muộn hơn hoặc giảm look_back."
+                ),
+            )
+        if stats["test_windows"] <= 0:
+            return (
+                False,
+                (
+                    "Không có mẫu test (test_windows=0). "
+                    "Hãy đặt split_date sớm hơn hoặc chọn ngày bắt đầu sớm hơn."
+                ),
+            )
+
+        return (
+            True,
+            (
+                f"Hợp lệ: train_windows={stats['train_windows']}, "
+                f"test_windows={stats['test_windows']}, total_windows={stats['total_windows']}."
+            ),
+        )
+
+    def train_final_model(
+        self,
+        params: LSTMHyperParameters,
+        callbacks: list[tf.keras.callbacks.Callback] | None = None,
+    ):
         model_result = self._train_model(
             params=params,
             epochs=self.config.final_training_epochs,
             validation_split=0.15,
             patience=self.config.baseline.patience,
             verbose=1,
+            callbacks=callbacks,
         )
         return model_result
 
-    def train_baseline_model(self):
+    def fine_tune_model(
+        self,
+        params: LSTMHyperParameters,
+        base_model,
+        callbacks: list[tf.keras.callbacks.Callback] | None = None,
+    ):
+        return self._train_model(
+            params=params,
+            epochs=self.config.fine_tune.epochs,
+            validation_split=self.config.fine_tune.validation_split,
+            patience=self.config.fine_tune.patience,
+            verbose=1,
+            callbacks=callbacks,
+            initial_model=base_model,
+            learning_rate=params.learning_rate * self.config.fine_tune.learning_rate_factor,
+        )
+
+    def train_baseline_model(self, callbacks: list[tf.keras.callbacks.Callback] | None = None):
         baseline_params = LSTMHyperParameters(
             look_back=self.config.baseline.look_back,
             hidden_units=self.config.baseline.hidden_units,
@@ -100,12 +192,13 @@ class PSOLSTMExperiment:
             validation_split=self.config.baseline.validation_split,
             patience=self.config.baseline.patience,
             verbose=1,
+            callbacks=callbacks,
         )
 
     def save_artifacts(
         self,
         model,
-        best_result: OptimizationResult,
+        best_result: OptimizationResult | None,
         metrics: RegressionMetrics,
     ) -> None:
         artifact_dir = self.config.artifact_dir
@@ -113,14 +206,15 @@ class PSOLSTMExperiment:
 
         save_keras_model(artifact_dir / "model_PSO_LSTM_final.h5", model)
         save_joblib_object(artifact_dir / "scaler_gold.pkl", self.scaler_gold)
-        save_json(
-            artifact_dir / "best_params.json",
-            {
-                **asdict(best_result.params),
-                "cost": best_result.cost,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        )
+        if best_result is not None:
+            save_json(
+                artifact_dir / "best_params.json",
+                {
+                    **asdict(best_result.params),
+                    "cost": best_result.cost,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
         save_json(
             artifact_dir / "model_metrics.json",
             {
@@ -157,14 +251,7 @@ class PSOLSTMExperiment:
         csv_path = Path(__file__).resolve().parents[1] / "gia_vang_benchmark.csv"
         if csv_path.exists() and not refresh:
             self.raw_df = pd.read_csv(csv_path)
-            self.prepared_df = self.raw_df.copy()
-            self._normalize_date_column(self.prepared_df)
-            self.scaled_data, self.scaler_gold, self.feature_scaler, self.feature_columns = (
-                prepare_multivariate_features(self.prepared_df)
-            )
-            self.num_features = int(self.scaled_data.shape[1])
-            self.split_index = self._resolve_split_index(self.prepared_df, self.config.data.split_date)
-            return self.prepared_df
+            return self._prepare_filtered_data(self.raw_df)
 
         return self.load_and_prepare_data()
 
@@ -276,9 +363,17 @@ class PSOLSTMExperiment:
         validation_split: float,
         patience: int,
         verbose: int,
+        callbacks: list[tf.keras.callbacks.Callback] | None = None,
+        initial_model=None,
+        learning_rate: float | None = None,
     ) -> dict[str, object]:
         self._ensure_prepared()
         x_values, y_values = create_multivariate_dataset(self.scaled_data, params.look_back)
+        if len(x_values) == 0:
+            raise ValueError(
+                "Không đủ dữ liệu để tạo chuỗi huấn luyện. Hãy giảm look_back hoặc mở rộng khoảng thời gian dữ liệu."
+            )
+
         x_train, y_train, x_test, y_test = split_windows_by_index(
             x_values,
             y_values,
@@ -286,26 +381,47 @@ class PSOLSTMExperiment:
             params.look_back,
         )
 
-        model = build_stacked_lstm_model(
-            input_shape=(params.look_back, self.num_features),
-            hidden_units=params.hidden_units,
-            num_layers=params.num_layers,
-            dropout_rate=params.dropout_rate,
-            learning_rate=params.learning_rate,
-        )
+        if len(x_train) == 0:
+            raise ValueError(
+                "Không có mẫu train sau khi tách dữ liệu. Hãy điều chỉnh split_date hoặc giảm look_back."
+            )
+        if len(x_test) == 0:
+            raise ValueError(
+                "Không có mẫu test sau khi tách dữ liệu. Hãy điều chỉnh split_date để còn dữ liệu đánh giá."
+            )
+
+        validation_split = float(np.clip(validation_split, 0.0, 0.99))
+        validation_samples = int(len(x_train) * validation_split)
+        effective_validation_split = validation_split if validation_samples > 0 else 0.0
+        monitor_metric = "val_loss" if effective_validation_split > 0 else "loss"
+        effective_batch_size = min(int(params.batch_size), len(x_train))
+
+        effective_learning_rate = learning_rate if learning_rate is not None else params.learning_rate
+        if initial_model is None:
+            model = build_stacked_lstm_model(
+                input_shape=(params.look_back, self.num_features),
+                hidden_units=params.hidden_units,
+                num_layers=params.num_layers,
+                dropout_rate=params.dropout_rate,
+                learning_rate=effective_learning_rate,
+            )
+        else:
+            model = initial_model
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=effective_learning_rate), loss="mse")
 
         early_stopping = tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
+            monitor=monitor_metric,
             patience=patience,
             restore_best_weights=True,
         )
+        fit_callbacks = [early_stopping, *(callbacks or [])]
         model.fit(
             x_train,
             y_train,
             epochs=epochs,
-            batch_size=params.batch_size,
-            validation_split=validation_split,
-            callbacks=[early_stopping],
+            batch_size=effective_batch_size,
+            validation_split=effective_validation_split,
+            callbacks=fit_callbacks,
             verbose=verbose,
             shuffle=False,
         )
@@ -314,12 +430,14 @@ class PSOLSTMExperiment:
         y_true = self.scaler_gold.inverse_transform(y_test.reshape(-1, 1)).flatten()
         predictions = self.scaler_gold.inverse_transform(predictions_scaled).flatten()
         metrics = evaluate_regression(y_true, predictions)
+        test_dates = pd.to_datetime(self.prepared_df["Date"]).iloc[self.split_index : self.split_index + len(y_test)].to_list()
 
         return {
             "model": model,
             "metrics": metrics,
             "y_true": y_true,
             "predictions": predictions,
+            "test_dates": test_dates,
             "train_size": len(x_train),
             "test_size": len(x_test),
         }
@@ -337,10 +455,39 @@ class PSOLSTMExperiment:
 
     def _resolve_split_index(self, df: pd.DataFrame, split_date: str) -> int:
         split_timestamp = pd.to_datetime(split_date)
-        split_matches = df.index[df["Date"] >= split_timestamp]
+        split_matches = np.flatnonzero((df["Date"] >= split_timestamp).to_numpy())
         if len(split_matches) == 0:
             raise ValueError(f"split_date {split_date} nằm ngoài phạm vi dữ liệu hiện có.")
         return int(split_matches[0])
+
+    def _prepare_filtered_data(self, raw_df: pd.DataFrame) -> pd.DataFrame:
+        prepared_df = raw_df.copy()
+        self._normalize_date_column(prepared_df)
+
+        min_allowed_start = pd.Timestamp("2005-01-01")
+        requested_start = pd.to_datetime(self.config.data.start_date)
+        if requested_start < min_allowed_start:
+            raise ValueError("Ngày bắt đầu dữ liệu không được trước 2005-01-01.")
+
+        prepared_df = prepared_df.loc[prepared_df["Date"] >= requested_start].copy()
+        if prepared_df.empty:
+            raise ValueError("Không có dữ liệu sau ngày bắt đầu được chọn.")
+
+        prepared_df = prepared_df.sort_values("Date").reset_index(drop=True)
+
+        split_timestamp = pd.to_datetime(self.config.data.split_date)
+        min_date = prepared_df["Date"].min()
+        max_date = prepared_df["Date"].max()
+        if split_timestamp < min_date or split_timestamp > max_date:
+            raise ValueError("Ngày chia train/test phải nằm trong phạm vi dữ liệu đã lọc.")
+
+        self.prepared_df = prepared_df
+        self.scaled_data, self.scaler_gold, self.feature_scaler, self.feature_columns = (
+            prepare_multivariate_features(self.prepared_df)
+        )
+        self.num_features = int(self.scaled_data.shape[1])
+        self.split_index = self._resolve_split_index(self.prepared_df, self.config.data.split_date)
+        return self.prepared_df
 
     @staticmethod
     def _normalize_date_column(df: pd.DataFrame) -> None:
